@@ -1,0 +1,15 @@
+﻿backend/venv/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite3
+node_modules/
+.next/
+out/
+.env
+.env.local
+backend/.env
+frontend/fop-platform/.env.local
+.vscode/
+.DS_Store
+Thumbs.db
