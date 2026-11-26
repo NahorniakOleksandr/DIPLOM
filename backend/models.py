@@ -1,9 +1,11 @@
 import enum
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
+from typing import Optional
 
 from sqlalchemy import (
-    DateTime, Enum, ForeignKey, Index, Numeric, String, Text, CheckConstraint,
+    JSON, Boolean, CheckConstraint, Date, DateTime, Enum, ForeignKey, Index, Integer, Numeric, String, Text,
+    Time, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -20,9 +22,24 @@ class UserRole(str, enum.Enum):
 
 
 class BookingStatus(str, enum.Enum):
+    """
+    Потік: pending (очікує підтвердження) → confirmed (підтверджено) → completed (завершено).
+    Альтернативи: rejected (відхилив спеціаліст), cancelled (скасував ФОП).
+    paid лишився для сумісності зі старим ендпоінтом /fop/bookings/{id}/pay.
+    Усі значення ≤ 9 символів — вміщаються в існуючу колонку VARCHAR(9).
+    PostgreSQL з native enum: ALTER TYPE booking_status ADD VALUE 'confirmed' (так само rejected, cancelled).
+    """
     pending = "pending"
     paid = "paid"
     completed = "completed"
+    confirmed = "confirmed"
+    rejected = "rejected"
+    cancelled = "cancelled"
+
+
+class Specialization(str, enum.Enum):
+    accountant = "accountant"
+    lawyer = "lawyer"
 
 
 class User(Base):
@@ -38,6 +55,22 @@ class User(Base):
     services: Mapped[list["Service"]] = relationship(
         back_populates="expert", cascade="all, delete-orphan"
     )
+    expert_profile: Mapped[Optional["ExpertProfile"]] = relationship(
+        back_populates="user", uselist=False, cascade="all, delete-orphan"
+    )
+
+    # Зручні читання для публічної картки спеціаліста (pydantic from_attributes)
+    @property
+    def specialization(self) -> Optional[Specialization]:
+        return self.expert_profile.specialization if self.expert_profile else None
+
+    @property
+    def headline(self) -> str:
+        return (self.expert_profile.headline if self.expert_profile else "") or ""
+
+    @property
+    def bio(self) -> str:
+        return (self.expert_profile.bio if self.expert_profile else "") or ""
 
 
 class Service(Base):
@@ -93,3 +126,155 @@ class LawArticle(Base):
     title: Mapped[str] = mapped_column(String(500), index=True)
     source_url: Mapped[str] = mapped_column(String(1000))
     content: Mapped[str] = mapped_column(Text)
+
+
+# =====================================================================
+# Профіль ФОПа та ШІ-помічник
+# Нові таблиці створюються через create_all — існуючі таблиці не змінюються.
+# =====================================================================
+class FopProfile(Base):
+    """Параметри підприємця, що передаються в контекст ШІ та фахівцю."""
+
+    __tablename__ = "fop_profiles"
+    __table_args__ = (
+        CheckConstraint("tax_group IS NULL OR tax_group IN (1, 2, 3)", name="ck_fop_profile_group"),
+    )
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    tax_group: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Ставка у відсотках (для III групи — 3 або 5; для I/II — відсоток від ПМ/МЗП, якщо відомий)
+    tax_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2), nullable=True)
+    kveds: Mapped[list] = mapped_column(JSON, default=list)  # ["62.01", "63.11"]
+    has_employees: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class AiConversation(Base):
+    __tablename__ = "ai_conversations"
+    __table_args__ = (Index("ix_ai_conv_user_updated", "user_id", "updated_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(200), default="Нова розмова")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    messages: Mapped[list["AiMessage"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan", order_by="AiMessage.id"
+    )
+
+
+class AiMessage(Base):
+    __tablename__ = "ai_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("ai_conversations.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(16))  # "user" | "assistant"
+    content: Mapped[str] = mapped_column(Text)
+    # Лише для відповідей помічника: яку норму використано
+    found: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    article_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # без FK: статтю можуть видалити
+    article_title: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    source_url: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    conversation: Mapped["AiConversation"] = relationship(back_populates="messages")
+
+
+class BookingAiContext(Base):
+    """Короткий висновок діалогу з ШІ, прикріплений до заявки на консультацію."""
+
+    __tablename__ = "booking_ai_contexts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    booking_id: Mapped[int] = mapped_column(
+        ForeignKey("bookings.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    conversation_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("ai_conversations.id", ondelete="SET NULL"), nullable=True
+    )
+    summary: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# =====================================================================
+# Етап 2: трекер доходу, календар, профіль і розклад спеціаліста
+# (нові таблиці; існуючі не змінюються)
+# =====================================================================
+class IncomeEntry(Base):
+    """Надходження ФОПа — основа особистого лічильника ліміту доходу."""
+
+    __tablename__ = "income_entries"
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_income_amount_positive"),
+        Index("ix_income_user_date", "user_id", "received_on"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    received_on: Mapped[date] = mapped_column(Date)
+    note: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DeadlineCompletion(Base):
+    """Позначка «виконано» для податкового строку (ключ — з tax_rules, напр. eu-2026Q3)."""
+
+    __tablename__ = "deadline_completions"
+    __table_args__ = (UniqueConstraint("user_id", "deadline_key", name="uq_deadline_user_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    deadline_key: Mapped[str] = mapped_column(String(64))
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ExpertProfile(Base):
+    __tablename__ = "expert_profiles"
+    __table_args__ = (
+        CheckConstraint("slot_minutes BETWEEN 15 AND 240", name="ck_expert_slot_minutes"),
+    )
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    specialization: Mapped[Optional[Specialization]] = mapped_column(
+        Enum(Specialization, name="specialization"), nullable=True, index=True
+    )
+    headline: Mapped[str] = mapped_column(String(255), default="")
+    bio: Mapped[str] = mapped_column(Text, default="")
+    experience_years: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    slot_minutes: Mapped[int] = mapped_column(Integer, default=60)
+
+    user: Mapped["User"] = relationship(back_populates="expert_profile")
+
+
+class ExpertAvailability(Base):
+    """Робоче вікно спеціаліста в місцевому часі (Europe/Kyiv): день тижня + години."""
+
+    __tablename__ = "expert_availability"
+    __table_args__ = (
+        CheckConstraint("weekday BETWEEN 0 AND 6", name="ck_avail_weekday"),
+        CheckConstraint("end_time > start_time", name="ck_avail_time_order"),
+        Index("ix_avail_expert_weekday", "expert_id", "weekday"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    expert_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    weekday: Mapped[int] = mapped_column(Integer)  # 0 = понеділок
+    start_time: Mapped[time] = mapped_column(Time)
+    end_time: Mapped[time] = mapped_column(Time)
+
+
+class BookingDetail(Base):
+    """Додаткові дані консультації: посилання на зустріч, причина відхилення, нотатки й підсумок спеціаліста."""
+
+    __tablename__ = "booking_details"
+
+    booking_id: Mapped[int] = mapped_column(ForeignKey("bookings.id", ondelete="CASCADE"), primary_key=True)
+    meeting_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    expert_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)    # приватні, ФОП не бачить
+    expert_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # підсумок для ФОПа
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
