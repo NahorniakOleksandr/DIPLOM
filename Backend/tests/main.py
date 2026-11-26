@@ -29,16 +29,31 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 import schemas
+from ai_service import create_ai_router
 from database import IS_SQLITE, SessionLocal, engine, get_db, init_db
+from fop_cabinet import (
+    FREED_STATUSES,
+    backfill_expert_profiles,
+    create_fop_cabinet_router,
+    ensure_expert_profile,
+    load_schedule,
+)
 from models import (
+    AiConversation,
     Booking,
+    BookingAiContext,
+    BookingDetail,
     BookingStatus,
+    ExpertProfile,
+    FopProfile,
     LawArticle,
     Message,
     Service,
+    Specialization,
     User,
     UserRole,
 )
+from scheduling import MIN_NOTICE_MINUTES, is_valid_slot
 
 logger = logging.getLogger("fop_platform")
 
@@ -206,6 +221,9 @@ def booking_critical_section(db: Session, expert_id: int) -> Iterator[None]:
 class ExpertPublic(schemas.ORMModel):
     id: int
     full_name: str
+    specialization: Optional[Specialization] = None
+    headline: str = ""
+    bio: str = ""
     services: list[schemas.ServiceRead] = []
 
 
@@ -250,6 +268,9 @@ def register(payload: schemas.UserCreate, db: DbDep):
     )
     db.add(user)
     try:
+        if user.role == UserRole.expert:
+            db.flush()  # отримуємо user.id
+            ensure_expert_profile(db, user.id, payload.specialization)  # профіль + типовий розклад
         db.commit()
     except IntegrityError:  # гонка: паралельна реєстрація з тим самим email
         db.rollback()
@@ -262,7 +283,7 @@ def login(payload: schemas.UserLogin, db: DbDep):
     user = authenticate(db, payload.email, payload.password)
     if user is None:
         raise _invalid_credentials()
-    return schemas.Token(access_token=create_access_token(user))
+    return schemas.Token(access_token=create_access_token(user), role=user.role, full_name=user.full_name)
 
 
 @auth_router.post("/token", response_model=schemas.Token, include_in_schema=True)
@@ -367,15 +388,28 @@ def list_expert_bookings(
     return list(db.scalars(stmt))
 
 
+# Дозволені переходи статусів (ключ — цільовий статус, значення — з яких можна перейти)
+_EXPERT_TRANSITIONS: dict[BookingStatus, tuple[BookingStatus, ...]] = {
+    BookingStatus.confirmed: (BookingStatus.pending,),
+    BookingStatus.rejected: (BookingStatus.pending,),
+    BookingStatus.completed: (BookingStatus.confirmed, BookingStatus.paid),
+}
+
+
 @expert_router.patch("/bookings/{booking_id}/status", response_model=schemas.BookingRead)
-def complete_booking(
+def update_booking_status(
     booking_id: int, payload: schemas.BookingStatusUpdate, db: DbDep, expert: ExpertUser
 ):
-    """Спеціаліст може лише позначити оплачену консультацію як завершену (paid → completed)."""
-    if payload.status != BookingStatus.completed:
+    """
+    Спеціаліст керує заявкою:
+      pending → confirmed (опційно meeting_url) | rejected (опційно reason);
+      confirmed → completed.
+    """
+    allowed_from = _EXPERT_TRANSITIONS.get(payload.status)
+    if allowed_from is None:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "Спеціаліст може змінити статус лише на 'completed'",
+            "Спеціаліст може встановити лише статуси: confirmed, rejected, completed",
         )
 
     booking = db.scalar(
@@ -384,16 +418,29 @@ def complete_booking(
     if booking is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Запис не знайдено")
 
-    # Атомарний перехід: UPDATE спрацює лише якщо статус досі 'paid'
+    # Атомарний перехід: UPDATE спрацює лише якщо статус досі дозволяє цей перехід
     result = db.execute(
         update(Booking)
-        .where(Booking.id == booking_id, Booking.status == BookingStatus.paid)
-        .values(status=BookingStatus.completed)
+        .where(Booking.id == booking_id, Booking.status.in_(allowed_from))
+        .values(status=payload.status)
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:  # type: ignore[attr-defined]
         db.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, "Завершити можна лише оплачену консультацію")
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Перехід неможливий: поточний статус запису — «{booking.status.value}»",
+        )
+
+    if (payload.status == BookingStatus.confirmed and payload.meeting_url) or (
+        payload.status == BookingStatus.rejected and payload.reason
+    ):
+        detail = db.get(BookingDetail, booking_id) or BookingDetail(booking_id=booking_id)
+        if payload.status == BookingStatus.confirmed:
+            detail.meeting_url = payload.meeting_url
+        else:
+            detail.rejection_reason = payload.reason.strip() if payload.reason else None
+        db.add(detail)
 
     db.commit()
     db.refresh(booking)
@@ -417,6 +464,12 @@ def search_experts(
     max_price: Annotated[
         Optional[Decimal], Query(ge=0, description="Є хоча б одна послуга не дорожча за цю ціну")
     ] = None,
+    specialization: Annotated[
+        Optional[Specialization], Query(description="accountant (бухгалтер) або lawyer (юрист)")
+    ] = None,
+    with_services: Annotated[
+        bool, Query(description="Лише спеціалісти, у яких є хоча б одна послуга (до них можна записатись)")
+    ] = False,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     offset: Annotated[int, Query(ge=0)] = 0,
 ):
@@ -437,9 +490,13 @@ def search_experts(
         )
     if max_price is not None:
         stmt = stmt.where(User.services.any(Service.price <= max_price))
+    if specialization is not None:
+        stmt = stmt.where(User.expert_profile.has(ExpertProfile.specialization == specialization))
+    if with_services:
+        stmt = stmt.where(User.services.any())
 
     stmt = (
-        stmt.options(selectinload(User.services))
+        stmt.options(selectinload(User.services), selectinload(User.expert_profile))
         .order_by(User.full_name, User.id)
         .limit(limit)
         .offset(offset)
@@ -451,7 +508,7 @@ def _get_expert_or_404(db: Session, expert_id: int) -> User:
     expert = db.scalar(
         select(User)
         .where(User.id == expert_id, User.role == UserRole.expert)
-        .options(selectinload(User.services))
+        .options(selectinload(User.services), selectinload(User.expert_profile))
     )
     if expert is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Спеціаліста не знайдено")
@@ -479,12 +536,42 @@ def create_booking(payload: schemas.BookingCreate, db: DbDep, fop: FopUser):
     if service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Послугу не знайдено")
 
+    # Ескалація з ШІ-чату: діалог має належати цьому ФОПу
+    ai_summary = (payload.ai_summary or "").strip()
+    if payload.ai_conversation_id is not None:
+        owns_conversation = db.scalar(
+            select(AiConversation.id).where(
+                AiConversation.id == payload.ai_conversation_id, AiConversation.user_id == fop.id
+            )
+        )
+        if owns_conversation is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Розмову з ШІ-помічником не знайдено")
+
+    # Час має бути реальним слотом із розкладу спеціаліста й не ближче ніж за MIN_NOTICE_MINUTES
+    windows, slot_minutes = load_schedule(db, service.expert_id)
+    if not windows:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Спеціаліст ще не налаштував розклад")
+    if not is_valid_slot(slot, windows, slot_minutes):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Цей час недоступний для запису. Оберіть вільний слот зі списку.",
+        )
+    if slot < datetime.now(timezone.utc) + timedelta(minutes=MIN_NOTICE_MINUTES):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Записатися можна щонайменше за {MIN_NOTICE_MINUTES} хвилин до початку",
+        )
+
     # Перевірка зайнятості слота і вставка виконуються в одній критичній секції:
     # конкурентний запит на той самий слот дочекається завершення цього і отримає 409.
     with booking_critical_section(db, service.expert_id):
         slot_taken = db.scalar(
             select(Booking.id)
-            .where(Booking.expert_id == service.expert_id, Booking.slot_datetime == slot)
+            .where(
+                Booking.expert_id == service.expert_id,
+                Booking.slot_datetime == slot,
+                Booking.status.notin_(FREED_STATUSES),  # відхилені/скасовані звільняють слот
+            )
             .limit(1)
         )
         if slot_taken is not None:
@@ -500,6 +587,15 @@ def create_booking(payload: schemas.BookingCreate, db: DbDep, fop: FopUser):
         )
         db.add(booking)
         try:
+            if ai_summary:
+                db.flush()  # отримуємо booking.id
+                db.add(
+                    BookingAiContext(
+                        booking_id=booking.id,
+                        conversation_id=payload.ai_conversation_id,
+                        summary=ai_summary,
+                    )
+                )
             db.commit()
         except IntegrityError:  # напр., послугу видалили між перевіркою і вставкою
             db.rollback()
@@ -520,6 +616,36 @@ def list_fop_bookings(
         stmt = stmt.where(Booking.status == status_filter)
     stmt = stmt.order_by(Booking.slot_datetime, Booking.id).limit(limit).offset(offset)
     return list(db.scalars(stmt))
+
+
+def _profile_read(profile: Optional[FopProfile]) -> schemas.FopProfileRead:
+    return schemas.FopProfileRead.model_validate(profile) if profile else schemas.FopProfileRead()
+
+
+@fop_router.get("/profile", response_model=schemas.FopProfileRead)
+def get_fop_profile(db: DbDep, fop: FopUser):
+    """Профіль підприємця. Якщо ще не заповнений — повертає порожні значення (не 404)."""
+    return _profile_read(db.get(FopProfile, fop.id))
+
+
+@fop_router.put("/profile", response_model=schemas.FopProfileRead)
+def save_fop_profile(payload: schemas.FopProfileUpdate, db: DbDep, fop: FopUser):
+    """Зберігає групу, ставку, КВЕДи та наявність працівників (повна заміна)."""
+    profile = db.get(FopProfile, fop.id)
+    if profile is None:
+        profile = FopProfile(user_id=fop.id)
+        db.add(profile)
+    profile.tax_group = payload.tax_group
+    profile.tax_rate = payload.tax_rate
+    profile.kveds = payload.kveds
+    profile.has_employees = payload.has_employees
+    try:
+        db.commit()
+    except IntegrityError:  # гонка: паралельне створення профілю
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "Не вдалося зберегти профіль. Спробуйте ще раз.")
+    db.refresh(profile)
+    return _profile_read(profile)
 
 
 @fop_router.post("/bookings/{booking_id}/pay", response_model=schemas.BookingRead)
@@ -879,13 +1005,20 @@ def seed_data() -> None:
 async def lifespan(_app: FastAPI):
     init_db()
     seed_data()
+    with SessionLocal() as db:
+        backfill_expert_profiles(db)  # профіль і розклад для спеціалістів, створених до Етапу 2
+    if not os.getenv("ANTHROPIC_API_KEY", "").strip():
+        logger.warning(
+            "ANTHROPIC_API_KEY не задано — ШІ-помічник відповідатиме повідомленням про недоступність. "
+            "Додайте ключ у backend/.env."
+        )
     yield
 
 
 app = FastAPI(
     title="FOP Consulting Platform API",
     description="Платформа консультацій: ФОП ↔ бухгалтери та юристи",
-    version="1.0.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -902,3 +1035,5 @@ app.include_router(expert_router)
 app.include_router(fop_router)
 app.include_router(chat_router)
 app.include_router(law_router)
+app.include_router(create_ai_router(get_current_user))  # /api/ai/*
+app.include_router(create_fop_cabinet_router(get_current_user, require_role))  # /fop/dashboard, /fop/income, …
