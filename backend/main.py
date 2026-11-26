@@ -29,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 import schemas
-from ai_service import create_ai_router
+from ai_service import check_provider_at_startup, create_ai_router
 from database import IS_SQLITE, SessionLocal, engine, get_db, init_db
 from expert_cabinet import create_expert_cabinet_router
 from news_api import create_news_router, start_news_sync
@@ -953,11 +953,7 @@ async def lifespan(_app: FastAPI):
     seed_data()
     with SessionLocal() as db:
         backfill_expert_profiles(db)  # профіль і розклад для спеціалістів, створених до Етапу 2
-    if not os.getenv("ANTHROPIC_API_KEY", "").strip():
-        logger.warning(
-            "ANTHROPIC_API_KEY не задано — ШІ-помічник відповідатиме повідомленням про недоступність. "
-            "Додайте ключ у backend/.env."
-        )
+    await check_provider_at_startup()  # підказка в логах: чи запущено Ollama / чи є ключ Claude
     news_task = start_news_sync()  # фонове оновлення офіційних стрічок (NEWS_FEEDS у .env)
     try:
         yield

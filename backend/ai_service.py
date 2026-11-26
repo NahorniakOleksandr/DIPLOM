@@ -2,7 +2,7 @@
 ai_service.py — ШІ-помічник для ФОПів.
 
 Принцип роботи (не змінився): детермінований пошук статті в базі законів (TF-IDF)
-→ Claude лише перефразовує знайдену статтю простою мовою. Нічого, чого немає в
+→ модель (Ollama або Claude) лише перефразовує знайдену статтю простою мовою. Нічого, чого немає в
 статті, помічник не додає.
 
 Що нового:
@@ -20,8 +20,14 @@ ai_service.py — ШІ-помічник для ФОПів.
     from ai_service import create_ai_router
     app.include_router(create_ai_router(get_current_user))
 
+Провайдер моделі (перемикається в backend/.env, код і промпти однакові для обох):
+  * ollama    — локальна модель через Ollama, безкоштовно й без ключів (див. ai_provider.py);
+  * anthropic — Claude через хмарний API (потрібен ключ).
+
 Змінні оточення (backend/.env):
-    ANTHROPIC_API_KEY         — ключ API (обов'язково)
+    AI_PROVIDER               — ollama | anthropic (якщо не задано: anthropic, коли є ключ, інакше ollama)
+    OLLAMA_URL, OLLAMA_MODEL, OLLAMA_NUM_CTX, OLLAMA_TIMEOUT_SECONDS, OLLAMA_KEEP_ALIVE — див. ai_provider.py
+    ANTHROPIC_API_KEY         — ключ API (лише для AI_PROVIDER=anthropic)
     ANTHROPIC_MODEL           — модель (за замовчуванням claude-sonnet-5-5)
     AI_TIMEOUT_SECONDS        — таймаут запиту до Claude (за замовчуванням 30)
     AI_RATE_LIMIT_PER_MINUTE  — запитів до ШІ на користувача за хвилину (за замовчуванням 15)
@@ -41,13 +47,17 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
-import anthropic
+try:  # пакет потрібен лише для AI_PROVIDER=anthropic
+    import anthropic
+except ImportError:  # pragma: no cover
+    anthropic = None  # type: ignore[assignment]
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+import ai_provider
 import schemas
 from database import get_db
 from models import (
@@ -67,6 +77,8 @@ logger = logging.getLogger(__name__)
 # Налаштування
 # ============================================================================
 
+PROVIDER_OLLAMA = "ollama"
+PROVIDER_ANTHROPIC = "anthropic"
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5").strip() or "claude-sonnet-5-5"
 AI_TIMEOUT_SECONDS = float(os.getenv("AI_TIMEOUT_SECONDS", "30"))
 AI_RATE_LIMIT_PER_MINUTE = int(os.getenv("AI_RATE_LIMIT_PER_MINUTE", "15"))
@@ -102,6 +114,9 @@ MSG_SERVICE_ERROR = (
 MSG_RATE_LIMIT_UPSTREAM = "ШІ-помічник зараз перевантажений. Спробуйте, будь ласка, за хвилину."
 MSG_TIMEOUT = "ШІ-помічник відповідає надто довго. Спробуйте ще раз за кілька секунд."
 MSG_CONNECTION = "Не вдалося з'єднатися з сервісом ШІ. Перевірте з'єднання та спробуйте ще раз."
+MSG_MODEL_MISSING = (
+    "ШІ-модель ще не встановлена на сервері. Зверніться до адміністратора або запишіться на консультацію до фахівця."
+)
 MSG_USER_RATE_LIMIT = "Забагато запитів до ШІ-помічника. Зачекайте хвилину і спробуйте знову."
 
 SYSTEM_PROMPT = f"""Ти — асистент, який пояснює підприємцям (ФОП в Україні) норми законодавства простою мовою.
@@ -418,6 +433,9 @@ _client_lock = threading.Lock()
 def _get_client() -> anthropic.AsyncAnthropic:
     """Порожній ключ дає зрозумілу помилку для користувача замість 500."""
     global _client, _client_key
+    if anthropic is None:
+        logger.error("Пакет anthropic не встановлено (pip install anthropic)")
+        raise AIUnavailable(MSG_NOT_CONFIGURED)
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         logger.error("ANTHROPIC_API_KEY не задано (перевірте backend/.env)")
@@ -429,7 +447,7 @@ def _get_client() -> anthropic.AsyncAnthropic:
         return _client
 
 
-async def _call_claude(system: str, user_content: str, max_tokens: int) -> str:
+async def _call_anthropic(system: str, user_content: str, max_tokens: int) -> str:
     client = _get_client()
     try:
         response = await client.messages.create(
@@ -442,6 +460,79 @@ async def _call_claude(system: str, user_content: str, max_tokens: int) -> str:
     except anthropic.APIError as exc:
         raise _map_anthropic_error(exc) from exc
     return "".join(block.text for block in response.content if block.type == "text").strip()
+
+
+def current_provider() -> str:
+    """AI_PROVIDER із .env; без нього — Claude, якщо є ключ API (так працювали раніше), інакше локальна Ollama."""
+    explicit = os.getenv("AI_PROVIDER", "").strip().lower()
+    if explicit in (PROVIDER_OLLAMA, PROVIDER_ANTHROPIC):
+        return explicit
+    if explicit:
+        logger.warning("AI_PROVIDER=%r не розпізнано (потрібно ollama або anthropic) — ігнорую", explicit)
+    return PROVIDER_ANTHROPIC if os.getenv("ANTHROPIC_API_KEY", "").strip() else PROVIDER_OLLAMA
+
+
+def _map_provider_error(exc: ai_provider.ProviderError) -> AIUnavailable:
+    """Технічні деталі та підказка розробнику — в лог, користувачеві — зрозуміле повідомлення."""
+    if exc.kind == "connection":
+        logger.error("Ollama недоступна — запустіть її (команда `ollama serve` або застосунок Ollama): %s", exc.detail)
+        return AIUnavailable(MSG_CONNECTION)
+    if exc.kind == "timeout":
+        logger.warning("Ollama: таймаут — збільште OLLAMA_TIMEOUT_SECONDS або візьміть меншу модель: %s", exc.detail)
+        return AIUnavailable(MSG_TIMEOUT)
+    if exc.kind == "model_missing":
+        logger.error("Ollama: модель не завантажена — виконайте `ollama pull <модель>`: %s", exc.detail)
+        return AIUnavailable(MSG_MODEL_MISSING)
+    logger.error("Ollama: помилка (%s): %s", exc.kind, exc.detail)
+    return AIUnavailable(MSG_SERVICE_ERROR)
+
+
+async def _call_ollama(system: str, user_content: str, max_tokens: int) -> str:
+    try:
+        # Виклик синхронний (urllib) — виносимо з event loop, щоб довга відповідь не блокувала інших
+        result = await run_in_threadpool(ai_provider.chat, system, user_content, max_tokens)
+    except ai_provider.ProviderError as exc:
+        raise _map_provider_error(exc) from exc
+    logger.info(
+        "ollama: %.1f с, токенів запиту=%s, відповіді=%s",
+        result.seconds, result.prompt_tokens, result.completion_tokens,
+    )
+    return result.text
+
+
+async def _call_llm(system: str, user_content: str, max_tokens: int) -> str:
+    """Єдина точка виклику моделі: решта коду не знає, Claude це чи локальна Ollama."""
+    if current_provider() == PROVIDER_OLLAMA:
+        return await _call_ollama(system, user_content, max_tokens)
+    return await _call_anthropic(system, user_content, max_tokens)
+
+
+async def check_provider_at_startup() -> None:
+    """Підказка в логах при старті: чи готовий вибраний провайдер. Ніколи не падає й не блокує запуск надовго."""
+    provider = current_provider()
+    if provider == PROVIDER_ANTHROPIC:
+        if anthropic is None:
+            logger.warning("AI_PROVIDER=anthropic, але пакет anthropic не встановлено (pip install anthropic).")
+        elif not os.getenv("ANTHROPIC_API_KEY", "").strip():
+            logger.warning(
+                "ANTHROPIC_API_KEY не задано — ШІ-помічник відповідатиме повідомленням про недоступність. "
+                "Додайте ключ у backend/.env або поставте AI_PROVIDER=ollama."
+            )
+        return
+    cfg = ai_provider.load_config()
+    state = await run_in_threadpool(ai_provider.ollama_status, cfg)
+    if not state.reachable:
+        logger.warning(
+            "ШІ: Ollama недоступна за адресою %s (%s). Запустіть Ollama; помічник відповідатиме, щойно вона з'явиться.",
+            cfg.base_url, state.error,
+        )
+    elif not state.model_present:
+        logger.warning(
+            "ШІ: модель %r не знайдено серед завантажених (%s). Виконайте: ollama pull %s",
+            cfg.model, ", ".join(state.models) or "список порожній", cfg.model,
+        )
+    else:
+        logger.info("ШІ: Ollama готова, модель %s, вікно контексту %s токенів.", cfg.model, cfg.num_ctx)
 
 
 def build_user_content(
@@ -485,7 +576,7 @@ async def answer_question(
     """
     1. Детермінований пошук по LawArticle (з урахуванням попереднього питання для уточнень).
     2. Нічого не знайдено → фіксована відповідь + порада звернутися до спеціаліста.
-    3. Знайдено → Claude перефразовує статтю з урахуванням профілю ФОПа та історії.
+    3. Знайдено → модель перефразовує статтю з урахуванням профілю ФОПа та історії.
 
     Кидає AIUnavailable, якщо ШІ недоступний.
     """
@@ -505,7 +596,7 @@ async def answer_question(
         article.id, hit.score, hit.matched_terms,
     )
 
-    text = await _call_claude(
+    text = await _call_llm(
         SYSTEM_PROMPT,
         build_user_content(question, article, profile_text, history or []),
         MAX_OUTPUT_TOKENS,
@@ -543,7 +634,7 @@ async def build_dialog_summary(dialog: list[tuple[str, str]]) -> tuple[str, str]
         for r, c in dialog[-SUMMARY_DIALOG_MESSAGES:]
     )
     try:
-        text = await _call_claude(
+        text = await _call_llm(
             SUMMARY_SYSTEM_PROMPT, f"<dialog>\n{dialog_text}\n</dialog>", SUMMARY_MAX_TOKENS
         )
     except AIUnavailable:
