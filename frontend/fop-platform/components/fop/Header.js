@@ -7,18 +7,19 @@ export const TABS = [
   { id: 'overview', label: 'Огляд' },
   { id: 'ai', label: 'ШІ-помічник' },
   { id: 'specialists', label: 'Фахівці та записи' },
+  { id: 'news', label: 'Новини' },
   { id: 'profile', label: 'Мій профіль ФОП' },
 ];
 
 /** Шапка кабінету ФОПа: спільний AppHeader + чіп із групою та ставкою. */
-export default function Header({ tab, onTab, profile, user, onLogout }) {
+export default function Header({ tab, onTab, profile, user, onLogout, newsBadge = 0 }) {
   const chip = profile?.tax_group
     ? `${groupLabel(profile.tax_group)}${profile.tax_rate != null ? ` + ${Number(profile.tax_rate)}%` : ''}`
     : 'Профіль не заповнено';
 
   return (
     <AppHeader
-      tabs={TABS}
+      tabs={TABS.map((t) => (t.id === 'news' ? { ...t, badge: newsBadge } : t))}
       tab={tab}
       onTab={onTab}
       user={user}
