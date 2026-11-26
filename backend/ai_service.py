@@ -436,7 +436,7 @@ def _get_client() -> anthropic.AsyncAnthropic:
     if anthropic is None:
         logger.error("Пакет anthropic не встановлено (pip install anthropic)")
         raise AIUnavailable(MSG_NOT_CONFIGURED)
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    api_key = _anthropic_key()
     if not api_key:
         logger.error("ANTHROPIC_API_KEY не задано (перевірте backend/.env)")
         raise AIUnavailable(MSG_NOT_CONFIGURED)
@@ -447,16 +447,36 @@ def _get_client() -> anthropic.AsyncAnthropic:
         return _client
 
 
+def _anthropic_key() -> str:
+    """
+    Ключ Claude з .env. Заготовку з .env.example («sk-ant-...») ключем не вважаємо: її копіюють у .env
+    разом із файлом, і через неї помічник помилково вибирав би Claude замість локальної Ollama.
+    """
+    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not key or key.endswith(("...", "…")) or len(key) < 20:
+        return ""
+    return key
+
+
 async def _call_anthropic(system: str, user_content: str, max_tokens: int) -> str:
     client = _get_client()
+    params = dict(
+        model=ANTHROPIC_MODEL,
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": user_content}],
+    )
     try:
-        response = await client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=max_tokens,
-            temperature=0,  # максимально детермінована відповідь
-            system=system,
-            messages=[{"role": "user", "content": user_content}],
-        )
+        try:
+            # temperature=0 — максимально детермінована відповідь
+            response = await client.messages.create(temperature=0, **params)
+        except TypeError as exc:
+            # Деякі версії SDK не приймають temperature — SDK відхиляє виклик ще до запиту в мережу,
+            # тож повтор без параметра безпечний.
+            if "temperature" not in str(exc):
+                raise
+            logger.warning("Anthropic SDK не приймає temperature — повторюю запит без нього: %s", exc)
+            response = await client.messages.create(**params)
     except anthropic.APIError as exc:
         raise _map_anthropic_error(exc) from exc
     return "".join(block.text for block in response.content if block.type == "text").strip()
@@ -469,7 +489,7 @@ def current_provider() -> str:
         return explicit
     if explicit:
         logger.warning("AI_PROVIDER=%r не розпізнано (потрібно ollama або anthropic) — ігнорую", explicit)
-    return PROVIDER_ANTHROPIC if os.getenv("ANTHROPIC_API_KEY", "").strip() else PROVIDER_OLLAMA
+    return PROVIDER_ANTHROPIC if _anthropic_key() else PROVIDER_OLLAMA
 
 
 def _map_provider_error(exc: ai_provider.ProviderError) -> AIUnavailable:
@@ -513,7 +533,7 @@ async def check_provider_at_startup() -> None:
     if provider == PROVIDER_ANTHROPIC:
         if anthropic is None:
             logger.warning("AI_PROVIDER=anthropic, але пакет anthropic не встановлено (pip install anthropic).")
-        elif not os.getenv("ANTHROPIC_API_KEY", "").strip():
+        elif not _anthropic_key():
             logger.warning(
                 "ANTHROPIC_API_KEY не задано — ШІ-помічник відповідатиме повідомленням про недоступність. "
                 "Додайте ключ у backend/.env або поставте AI_PROVIDER=ollama."
