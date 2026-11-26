@@ -278,3 +278,63 @@ class BookingDetail(Base):
     expert_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)    # приватні, ФОП не бачить
     expert_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # підсумок для ФОПа
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+# =====================================================================
+# Етап 4: новини (статті спеціалістів і офіційні стрічки)
+# Лише нові таблиці — існуючі не змінюються.
+# =====================================================================
+class NewsPost(Base):
+    """Новина: стаття спеціаліста (kind='article') або запис із офіційної стрічки (kind='official')."""
+
+    __tablename__ = "news_posts"
+    __table_args__ = (
+        Index("ix_news_published", "published_at", "id"),
+        Index("ix_news_importance_published", "importance", "published_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(10), index=True)            # article | official
+    title: Mapped[str] = mapped_column(String(200))
+    summary: Mapped[str] = mapped_column(String(320), default="")        # анонс для списку
+    body: Mapped[str] = mapped_column(Text)                              # простий текст (без HTML)
+    category: Mapped[str] = mapped_column(String(12), default="other", index=True)
+    importance: Mapped[str] = mapped_column(String(10), default="normal")  # normal | important
+    effective_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)  # коли зміна набирає чинності
+    author_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    source_url: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    external_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)  # sha1 для дедуплікації
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    author: Mapped[Optional["User"]] = relationship(foreign_keys=[author_id])
+
+
+class NewsRead(Base):
+    """Позначка «користувач прочитав / підтвердив повідомлення» — за нею гасне спливаюче вікно."""
+
+    __tablename__ = "news_reads"
+    __table_args__ = (UniqueConstraint("news_id", "user_id", name="uq_news_read"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    news_id: Mapped[int] = mapped_column(ForeignKey("news_posts.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    read_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class NewsFeedState(Base):
+    """Стан останнього оновлення кожної офіційної стрічки — щоб помилки було видно, а не ховати."""
+
+    __tablename__ = "news_feed_states"
+
+    url: Mapped[str] = mapped_column(String(500), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    last_fetched: Mapped[int] = mapped_column(Integer, default=0)   # записів у стрічці
+    last_added: Mapped[int] = mapped_column(Integer, default=0)     # нових збережено

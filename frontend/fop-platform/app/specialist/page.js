@@ -13,6 +13,9 @@ import ChatTab from '@/components/specialist/ChatTab';
 import ProfileTab from '@/components/specialist/ProfileTab';
 import ConsultationDrawer from '@/components/specialist/ConsultationDrawer';
 import useConsultationActions from '@/components/specialist/useConsultationActions';
+import NewsFeed from '@/components/news/NewsFeed';
+import ImportantNewsModal from '@/components/news/ImportantNewsModal';
+import useNewsUnread from '@/components/news/useNewsUnread';
 
 const HISTORY_LIMIT = 50;
 const POLL_MS = 30000;
@@ -48,6 +51,8 @@ export default function SpecialistCabinetPage() {
   useEffect(() => {
     checkAuth();
   }, [checkAuth]);
+
+  const news = useNewsUnread(auth.status === 'ready');
 
   // ---------- Дані кабінету (усе — з API) ----------
   const [tab, setTab] = useState('overview');
@@ -129,10 +134,11 @@ export default function SpecialistCabinetPage() {
       { id: 'requests', label: 'Заявки', badge: data.dashboard?.pending_count || 0 },
       { id: 'consultations', label: 'Консультації' },
       { id: 'schedule', label: 'Розклад' },
+      { id: 'news', label: 'Новини', badge: news.counts.unread },
       { id: 'chat', label: 'Чат' },
       { id: 'profile', label: 'Профіль' },
     ],
-    [data.dashboard],
+    [data.dashboard, news.counts.unread],
   );
 
   // ---------- Стани завантаження / помилки ----------
@@ -204,6 +210,8 @@ export default function SpecialistCabinetPage() {
 
         {tab === 'schedule' && <ScheduleTab onSaved={loadAll} />}
 
+        {tab === 'news' && <NewsFeed canWrite onUnreadChange={news.setCounts} />}
+
         {tab === 'chat' && <ChatTab meId={auth.user.id} initialPeer={chatPeer} />}
 
         {tab === 'profile' && (
@@ -226,6 +234,7 @@ export default function SpecialistCabinetPage() {
       />
 
       {actions.dialogs}
+      <ImportantNewsModal onChanged={news.refresh} />
     </div>
   );
 }

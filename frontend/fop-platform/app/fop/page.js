@@ -14,6 +14,9 @@ import IncomeModal from '@/components/fop/IncomeModal';
 import BookingDialog from '@/components/fop/BookingDialog';
 import ChatDrawer from '@/components/fop/ChatDrawer';
 import useAiChat from '@/components/fop/useAiChat';
+import NewsFeed from '@/components/news/NewsFeed';
+import ImportantNewsModal from '@/components/news/ImportantNewsModal';
+import useNewsUnread from '@/components/news/useNewsUnread';
 
 export default function FopCabinetPage() {
   const router = useRouter();
@@ -59,6 +62,7 @@ export default function FopCabinetPage() {
   const [chatPeer, setChatPeer] = useState(null);
   const [notice, setNotice] = useState('');
 
+  const news = useNewsUnread(auth.status === 'ready');
   const chat = useAiChat();
   const { refreshConversations } = chat;
 
@@ -155,7 +159,14 @@ export default function FopCabinetPage() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
-      <Header tab={tab} onTab={goTab} profile={dashboard?.profile} user={auth.user} onLogout={logout} />
+      <Header
+        tab={tab}
+        onTab={goTab}
+        profile={dashboard?.profile}
+        user={auth.user}
+        onLogout={logout}
+        newsBadge={news.counts.unread}
+      />
 
       <main className="mx-auto max-w-6xl px-4 py-7">
         {notice && (
@@ -204,6 +215,8 @@ export default function FopCabinetPage() {
           />
         )}
 
+        {tab === 'news' && <NewsFeed onUnreadChange={news.setCounts} />}
+
         {tab === 'profile' && (
           <ProfileTab user={auth.user} profile={dashboard?.profile} onSaved={loadDashboard} />
         )}
@@ -229,6 +242,7 @@ export default function FopCabinetPage() {
         onBooked={onBooked}
       />
       <ChatDrawer peer={chatPeer} meId={auth.user?.id} onClose={() => setChatPeer(null)} />
+      <ImportantNewsModal onChanged={news.refresh} />
     </div>
   );
 }

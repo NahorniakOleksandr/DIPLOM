@@ -32,6 +32,7 @@ import schemas
 from ai_service import create_ai_router
 from database import IS_SQLITE, SessionLocal, engine, get_db, init_db
 from expert_cabinet import create_expert_cabinet_router
+from news_api import create_news_router, start_news_sync
 from fop_cabinet import (
     FREED_STATUSES,
     backfill_expert_profiles,
@@ -957,7 +958,12 @@ async def lifespan(_app: FastAPI):
             "ANTHROPIC_API_KEY не задано — ШІ-помічник відповідатиме повідомленням про недоступність. "
             "Додайте ключ у backend/.env."
         )
-    yield
+    news_task = start_news_sync()  # фонове оновлення офіційних стрічок (NEWS_FEEDS у .env)
+    try:
+        yield
+    finally:
+        if news_task is not None:
+            news_task.cancel()
 
 
 app = FastAPI(
@@ -983,3 +989,4 @@ app.include_router(law_router)
 app.include_router(create_ai_router(get_current_user))  # /api/ai/*
 app.include_router(create_fop_cabinet_router(get_current_user, require_role))  # /fop/dashboard, /fop/income, …
 app.include_router(create_expert_cabinet_router(require_role))  # /expert/dashboard, /expert/consultations, …
+app.include_router(create_news_router(get_current_user, require_role))  # /news/*

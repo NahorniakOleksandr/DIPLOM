@@ -107,6 +107,11 @@ const FIELD_NAMES = {
   title: 'Назва',
   description: 'Опис',
   price: 'Ціна',
+  body: 'Текст',
+  category: 'Категорія',
+  importance: 'Важливість',
+  effective_date: 'Дата набрання чинності',
+  source_url: 'Посилання',
 };
 
 function translateMessage(msg) {
@@ -320,6 +325,34 @@ export const createService = ({ title, description, price }) =>
 export const updateService = (id, patch) => request(`/expert/services/${id}`, { method: 'PATCH', body: patch });
 export const deleteService = (id) => request(`/expert/services/${id}`, { method: 'DELETE' });
 
+// ---------- Новини (Етап 4) ----------
+/** Фільтри: kind (article|official), category, importance, unreadOnly, mine, q, limit, offset. */
+export const listNews = ({ kind, category, importance, unreadOnly, mine, q, limit = 20, offset = 0 } = {}) =>
+  request('/news', {
+    query: {
+      kind,
+      category,
+      importance,
+      unread_only: unreadOnly ? 'true' : undefined,
+      mine: mine ? 'true' : undefined,
+      q: q ? q.trim() : undefined,
+      limit,
+      offset,
+    },
+  });
+export const getNews = (id) => request(`/news/${id}`);
+export const getNewsUnread = () => request('/news/unread-count');
+export const getNewsPopup = () => request('/news/popup');
+export const markNewsRead = (id) => request(`/news/${id}/read`, { method: 'POST' });
+export const markAllNewsRead = () => request('/news/read-all', { method: 'POST' });
+
+// Лише для спеціалістів
+export const createNews = (payload) => request('/news', { method: 'POST', body: payload });
+export const updateNews = (id, patch) => request(`/news/${id}`, { method: 'PATCH', body: patch });
+export const deleteNews = (id) => request(`/news/${id}`, { method: 'DELETE' });
+export const getNewsSources = () => request('/news/sources');
+export const syncNews = () => request('/news/sync', { method: 'POST' });
+
 export const api = Object.assign(apiCall, {
   login, register, me, logout, getToken, setToken, clearToken,
   getFopProfile, saveFopProfile,
@@ -330,6 +363,8 @@ export const api = Object.assign(apiCall, {
   getExpertDashboard, listExpertConsultations, getExpertConsultation, updateExpertConsultation, setBookingStatus,
   listExpertClients, getExpertSchedule, saveExpertSchedule, getExpertProfile, saveExpertProfile,
   listMyServices, createService, updateService, deleteService,
+  listNews, getNews, getNewsUnread, getNewsPopup, markNewsRead, markAllNewsRead,
+  createNews, updateNews, deleteNews, getNewsSources, syncNews,
 });
 
 export default api;
