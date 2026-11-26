@@ -325,7 +325,7 @@ def create_fop_cabinet_router(get_current_user, require_role) -> APIRouter:
             return []
 
         ids = [b.id for b in bookings]
-        expert_ids = {b.expert_id for b in bookings}
+        expert_ids = list({b.expert_id for b in bookings})
         details = {d.booking_id: d for d in db.scalars(select(BookingDetail).where(BookingDetail.booking_id.in_(ids)))}
         with_ai = set(db.scalars(select(BookingAiContext.booking_id).where(BookingAiContext.booking_id.in_(ids))))
         profiles = {p.user_id: p for p in db.scalars(select(ExpertProfile).where(ExpertProfile.user_id.in_(expert_ids)))}
@@ -344,7 +344,8 @@ def create_fop_cabinet_router(get_current_user, require_role) -> APIRouter:
                     service_id=b.service_id, service_title=b.service.title, service_price=float(b.service.price),
                     meeting_url=detail.meeting_url if detail else None,
                     rejection_reason=detail.rejection_reason if detail else None,
-                    expert_summary=detail.expert_summary if detail else None,
+                    # Підсумок — лише після завершення; чернетку фахівця ФОП не бачить
+                    expert_summary=detail.expert_summary if detail and b.status == BookingStatus.completed else None,
                     has_ai_summary=b.id in with_ai,
                 )
             )

@@ -5,7 +5,7 @@ const BASE_URL = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').re
 
 // ---------- Токен ----------
 export const TOKEN_KEY = 'fop_token';
-// Сесія входу (token, role, name) одним JSON-об'єктом: її пишуть app/page.js і читають useGuard та Shell у components/ui.js.
+// Сесія входу (token, role, name) одним JSON-об'єктом: її пише сторінка входу app/page.js.
 const SESSION_KEY = 'session';
 
 function readSession() {
@@ -92,6 +92,21 @@ const FIELD_NAMES = {
   slot_datetime: 'Час',
   ai_summary: 'Підсумок',
   meeting_url: 'Посилання',
+  expert_notes: 'Нотатки',
+  expert_summary: 'Підсумок',
+  summary: 'Підсумок',
+  reason: 'Причина',
+  slot_minutes: 'Тривалість консультації',
+  windows: 'Розклад',
+  weekday: 'День тижня',
+  start: 'Початок',
+  end: 'Кінець',
+  headline: 'Заголовок',
+  bio: 'Про себе',
+  experience_years: 'Стаж',
+  title: 'Назва',
+  description: 'Опис',
+  price: 'Ціна',
 };
 
 function translateMessage(msg) {
@@ -247,9 +262,7 @@ export const getMessages = (peerId) => request(`/chat/messages/${peerId}`);
 export const sendMessage = (receiverId, content) =>
   request('/chat/messages', { method: 'POST', body: { receiver_id: receiverId, content } });
 
-// Сумісність зі сторінкою входу та кабінетом фахівця: api('/шлях', { method, body }) і session.
-export const API = BASE_URL;
-
+// Сумісність зі сторінкою входу (app/page.js): api('/шлях', { method, body }) і session.
 export const session = {
   get() {
     if (typeof window === 'undefined') return null;
@@ -269,12 +282,43 @@ export const session = {
   },
 };
 
-export const money = (n) => `${Number(n).toLocaleString('uk-UA')} ₴`;
-export const when = (s) => new Date(s).toLocaleString('uk-UA', { dateStyle: 'medium', timeStyle: 'short' });
-
 function apiCall(path, { method = 'GET', body } = {}) {
   return request(path, { method, body });
 }
+
+// ---------- Кабінет спеціаліста (Етап 3) ----------
+export const getExpertDashboard = () => request('/expert/dashboard');
+
+/** scope: requests (нові заявки) | upcoming (підтверджені) | history (архів) | all */
+export const listExpertConsultations = ({ scope = 'all', status, limit } = {}) =>
+  request('/expert/consultations', { query: { scope, status, limit } });
+export const getExpertConsultation = (id) => request(`/expert/consultations/${id}`);
+
+/** Часткове оновлення картки: передавайте лише змінені поля (meeting_url, expert_notes, expert_summary). */
+export const updateExpertConsultation = (id, patch) =>
+  request(`/expert/consultations/${id}`, { method: 'PATCH', body: patch });
+
+/** status: confirmed (+ meetingUrl) | rejected (+ reason) | completed (+ summary). */
+export const setBookingStatus = (id, { status, meetingUrl, reason, summary }) =>
+  request(`/expert/bookings/${id}/status`, {
+    method: 'PATCH',
+    body: { status, meeting_url: meetingUrl || undefined, reason: reason || undefined, summary },
+  });
+
+export const listExpertClients = () => request('/expert/clients');
+
+export const getExpertSchedule = () => request('/expert/schedule');
+export const saveExpertSchedule = ({ slotMinutes, windows }) =>
+  request('/expert/schedule', { method: 'PUT', body: { slot_minutes: slotMinutes, windows } });
+
+export const getExpertProfile = () => request('/expert/profile');
+export const saveExpertProfile = (patch) => request('/expert/profile', { method: 'PATCH', body: patch });
+
+export const listMyServices = () => request('/expert/services');
+export const createService = ({ title, description, price }) =>
+  request('/expert/services', { method: 'POST', body: { title, description, price } });
+export const updateService = (id, patch) => request(`/expert/services/${id}`, { method: 'PATCH', body: patch });
+export const deleteService = (id) => request(`/expert/services/${id}`, { method: 'DELETE' });
 
 export const api = Object.assign(apiCall, {
   login, register, me, logout, getToken, setToken, clearToken,
@@ -283,6 +327,9 @@ export const api = Object.assign(apiCall, {
   aiChat, listConversations, getConversation, deleteConversation, summarizeConversation, getBookingContext,
   listExperts, getExpertSlots, createBooking, listConsultations, cancelBooking,
   getMessages, sendMessage,
+  getExpertDashboard, listExpertConsultations, getExpertConsultation, updateExpertConsultation, setBookingStatus,
+  listExpertClients, getExpertSchedule, saveExpertSchedule, getExpertProfile, saveExpertProfile,
+  listMyServices, createService, updateService, deleteService,
 });
 
 export default api;

@@ -1,5 +1,5 @@
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -98,20 +98,26 @@ class BookingCreate(BaseModel):
         return v
 
 
+def _clean_meeting_url(v: Optional[str]) -> Optional[str]:
+    """Порожнє посилання → None; інакше лише http(s)."""
+    v = (v or "").strip()
+    if not v:
+        return None
+    if not re.match(r"^https?://\S+$", v, flags=re.IGNORECASE):
+        raise ValueError("Посилання має починатися з http:// або https://")
+    return v
+
+
 class BookingStatusUpdate(BaseModel):
     status: BookingStatus
     meeting_url: Optional[str] = Field(default=None, max_length=500, description="При підтвердженні")
-    reason: Optional[str] = Field(default=None, max_length=500, description="При відхиленні")
+    reason: Optional[str] = Field(default=None, max_length=500, description="При відхиленні/скасуванні")
+    summary: Optional[str] = Field(default=None, max_length=5000, description="При завершенні: підсумок для клієнта")
 
     @field_validator("meeting_url")
     @classmethod
     def valid_url(cls, v: Optional[str]) -> Optional[str]:
-        v = (v or "").strip()
-        if not v:
-            return None
-        if not re.match(r"^https?://\S+$", v, flags=re.IGNORECASE):
-            raise ValueError("Посилання має починатися з http:// або https://")
-        return v
+        return _clean_meeting_url(v)
 
 
 class BookingRead(ORMModel):
@@ -299,3 +305,183 @@ class BookingDetailRead(BaseModel):
     rejection_reason: Optional[str] = None
     expert_summary: Optional[str] = None
     has_ai_summary: bool = False
+
+
+# =====================================================================
+# Етап 3: кабінет спеціаліста
+# =====================================================================
+class ClientHistoryItem(BaseModel):
+    """Попередня консультація цього клієнта в цього спеціаліста."""
+
+    id: int
+    slot_datetime: datetime
+    status: BookingStatus
+    service_title: str
+    summary_preview: Optional[str] = None
+
+
+class ExpertConsultationRead(BaseModel):
+    """Рядок списку заявок/консультацій спеціаліста. Прапорці can_* рахує бекенд — інтерфейс їх лише показує."""
+
+    id: int
+    status: BookingStatus
+    slot_datetime: datetime
+    slot_end: datetime
+    created_at: datetime
+    client_id: int
+    client_name: str
+    client_profile: Optional[FopProfileRead] = None
+    service_id: int
+    service_title: str
+    service_price: float
+    meeting_url: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    has_ai_summary: bool = False
+    has_notes: bool = False
+    has_summary: bool = False
+    is_past: bool = False
+    can_confirm: bool = False
+    can_reject: bool = False
+    can_complete: bool = False
+
+
+class ExpertConsultationDetail(ExpertConsultationRead):
+    """Картка консультації: клієнт, контекст ШІ, приватні нотатки, підсумок, історія."""
+
+    ai_summary: Optional[str] = None
+    ai_summary_created_at: Optional[datetime] = None
+    expert_notes: Optional[str] = None      # приватні: ФОП їх не бачить
+    expert_summary: Optional[str] = None    # ФОП бачить лише після завершення
+    can_edit_meeting: bool = False
+    can_write_summary: bool = False
+    history: list[ClientHistoryItem] = Field(default_factory=list)
+
+
+class ConsultationUpdate(BaseModel):
+    """Часткове оновлення картки: змінюються лише передані поля; null/порожній рядок очищає поле."""
+
+    meeting_url: Optional[str] = Field(default=None, max_length=500)
+    expert_notes: Optional[str] = Field(default=None, max_length=5000)
+    expert_summary: Optional[str] = Field(default=None, max_length=5000)
+
+    @field_validator("meeting_url")
+    @classmethod
+    def valid_url(cls, v: Optional[str]) -> Optional[str]:
+        return _clean_meeting_url(v)
+
+    @model_validator(mode="after")
+    def at_least_one(self) -> "ConsultationUpdate":
+        if not self.model_fields_set:
+            raise ValueError("Передайте хоча б одне поле: meeting_url, expert_notes або expert_summary")
+        return self
+
+
+class ExpertSetupRead(BaseModel):
+    """Що ще потрібно налаштувати, щоб клієнти могли записатися."""
+
+    has_services: bool
+    has_schedule: bool
+    has_profile_text: bool
+
+
+class ExpertDashboardRead(BaseModel):
+    today: date
+    pending_count: int
+    today_count: int
+    upcoming_count: int
+    to_complete_count: int
+    completed_count: int
+    clients_count: int
+    next_consultation: Optional[ExpertConsultationRead] = None
+    setup: ExpertSetupRead
+
+
+class ExpertClientRead(BaseModel):
+    id: int
+    full_name: str
+    tax_group: Optional[int] = None
+    consultations_total: int
+    consultations_completed: int
+    next_slot_datetime: Optional[datetime] = None
+    last_slot_datetime: Optional[datetime] = None
+    last_message_at: Optional[datetime] = None
+
+
+class ScheduleWindow(BaseModel):
+    """Робоче вікно в київському часі (Europe/Kyiv): день тижня (0 = понеділок) і години."""
+
+    weekday: int = Field(ge=0, le=6)
+    start: time
+    end: time
+
+    @field_validator("start", "end")
+    @classmethod
+    def naive_time(cls, v: time) -> time:
+        if v.tzinfo is not None:
+            raise ValueError("Час має бути без часової зони (київський)")
+        return v
+
+
+class ScheduleRead(BaseModel):
+    slot_minutes: int
+    timezone: str
+    windows: list[ScheduleWindow]
+    # Майбутні активні записи, що не збігаються зі слотами поточного розкладу
+    outside_schedule_bookings: int = 0
+
+
+class ScheduleUpdate(BaseModel):
+    slot_minutes: int = Field(ge=15, le=240)
+    windows: list[ScheduleWindow] = Field(max_length=42)
+
+    @field_validator("slot_minutes")
+    @classmethod
+    def multiple_of_five(cls, v: int) -> int:
+        if v % 5:
+            raise ValueError("Тривалість консультації має бути кратною 5 хвилинам")
+        return v
+
+
+class ExpertProfileRead(BaseModel):
+    id: int
+    email: str
+    full_name: str
+    specialization: Optional[Specialization] = None
+    headline: str = ""
+    bio: str = ""
+    experience_years: Optional[int] = None
+    slot_minutes: int
+    services_count: int
+    completed_count: int
+    total_count: int
+
+
+class ExpertProfileUpdate(BaseModel):
+    """Часткове оновлення профілю: змінюються лише передані поля (experience_years: null очищає)."""
+
+    full_name: Optional[str] = Field(default=None, max_length=255)
+    specialization: Optional[Specialization] = None
+    headline: Optional[str] = Field(default=None, max_length=255)
+    bio: Optional[str] = Field(default=None, max_length=2000)
+    experience_years: Optional[int] = Field(default=None, ge=0, le=70)
+
+    @field_validator("full_name")
+    @classmethod
+    def valid_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip()
+        if len(v) < 2:
+            raise ValueError("Вкажіть імʼя та прізвище (мінімум 2 символи)")
+        return v
+
+    @field_validator("headline", "bio")
+    @classmethod
+    def strip_text(cls, v: Optional[str]) -> Optional[str]:
+        return v.strip() if v is not None else v
+
+    @model_validator(mode="after")
+    def at_least_one(self) -> "ExpertProfileUpdate":
+        if not self.model_fields_set:
+            raise ValueError("Немає полів для оновлення")
+        return self

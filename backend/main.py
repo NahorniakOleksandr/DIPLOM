@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session, selectinload
 import schemas
 from ai_service import create_ai_router
 from database import IS_SQLITE, SessionLocal, engine, get_db, init_db
+from expert_cabinet import create_expert_cabinet_router
 from fop_cabinet import (
     FREED_STATUSES,
     backfill_expert_profiles,
@@ -42,7 +43,6 @@ from models import (
     AiConversation,
     Booking,
     BookingAiContext,
-    BookingDetail,
     BookingStatus,
     ExpertProfile,
     FopProfile,
@@ -388,63 +388,8 @@ def list_expert_bookings(
     return list(db.scalars(stmt))
 
 
-# Дозволені переходи статусів (ключ — цільовий статус, значення — з яких можна перейти)
-_EXPERT_TRANSITIONS: dict[BookingStatus, tuple[BookingStatus, ...]] = {
-    BookingStatus.confirmed: (BookingStatus.pending,),
-    BookingStatus.rejected: (BookingStatus.pending,),
-    BookingStatus.completed: (BookingStatus.confirmed, BookingStatus.paid),
-}
-
-
-@expert_router.patch("/bookings/{booking_id}/status", response_model=schemas.BookingRead)
-def update_booking_status(
-    booking_id: int, payload: schemas.BookingStatusUpdate, db: DbDep, expert: ExpertUser
-):
-    """
-    Спеціаліст керує заявкою:
-      pending → confirmed (опційно meeting_url) | rejected (опційно reason);
-      confirmed → completed.
-    """
-    allowed_from = _EXPERT_TRANSITIONS.get(payload.status)
-    if allowed_from is None:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Спеціаліст може встановити лише статуси: confirmed, rejected, completed",
-        )
-
-    booking = db.scalar(
-        select(Booking).where(Booking.id == booking_id, Booking.expert_id == expert.id)
-    )
-    if booking is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Запис не знайдено")
-
-    # Атомарний перехід: UPDATE спрацює лише якщо статус досі дозволяє цей перехід
-    result = db.execute(
-        update(Booking)
-        .where(Booking.id == booking_id, Booking.status.in_(allowed_from))
-        .values(status=payload.status)
-        .execution_options(synchronize_session=False)
-    )
-    if result.rowcount != 1:  # type: ignore[attr-defined]
-        db.rollback()
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"Перехід неможливий: поточний статус запису — «{booking.status.value}»",
-        )
-
-    if (payload.status == BookingStatus.confirmed and payload.meeting_url) or (
-        payload.status == BookingStatus.rejected and payload.reason
-    ):
-        detail = db.get(BookingDetail, booking_id) or BookingDetail(booking_id=booking_id)
-        if payload.status == BookingStatus.confirmed:
-            detail.meeting_url = payload.meeting_url
-        else:
-            detail.rejection_reason = payload.reason.strip() if payload.reason else None
-        db.add(detail)
-
-    db.commit()
-    db.refresh(booking)
-    return booking
+# Зміна статусу заявки (PATCH /expert/bookings/{id}/status), картка консультації, розклад і профіль
+# живуть в expert_cabinet.py; правила переходів — у booking_rules.py.
 
 
 # =====================================================================
@@ -1037,3 +982,4 @@ app.include_router(chat_router)
 app.include_router(law_router)
 app.include_router(create_ai_router(get_current_user))  # /api/ai/*
 app.include_router(create_fop_cabinet_router(get_current_user, require_role))  # /fop/dashboard, /fop/income, …
+app.include_router(create_expert_cabinet_router(require_role))  # /expert/dashboard, /expert/consultations, …
