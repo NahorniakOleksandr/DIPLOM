@@ -1,6 +1,8 @@
 import os
 from typing import Iterator
 
+import config  # noqa: F401  — завантажує backend/.env до читання os.getenv
+
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
